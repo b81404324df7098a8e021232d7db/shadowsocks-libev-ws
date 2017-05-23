@@ -86,6 +86,9 @@ typedef struct remote {
     int addr_len;
     uint32_t counter;
 
+    // websocket
+    int handshake;
+
     buffer_t *buf;
 
     struct remote_ctx *recv_ctx;

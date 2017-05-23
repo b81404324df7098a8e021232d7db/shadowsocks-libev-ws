@@ -137,6 +137,69 @@ static server_t *new_server(int fd);
 
 static struct cork_dllist connections;
 
+int 
+send_handshake(int fd)
+{
+    char handshake[1024] = "";
+    strcpy(handshake, "GET / HTTP/1.1\r\n");
+    strcat(handshake, "Upgrade: websocket\r\n");
+    strcat(handshake, "Connection: Upgrade\r\n");
+    strcat(handshake, "Sec-WebSocket-Key: hi\r\n");
+    strcat(handshake, "Sec-WebSocket-Version: 13\r\n\r\n");
+    
+    ssize_t r = send(fd, handshake, strlen(handshake), 0);
+    LOGE("handshake\n %s", handshake);
+    return r;
+}
+
+int
+read_handshake(buffer_t* buf)
+{
+    char *start = buf->data;
+    char len = buf->len;
+    char *end = start - 4;
+
+    while(memcmp(end, "\r\n\r\n", 4) != 0 && end  - start <= len) {
+        end++;
+    }
+    if (end > start + len) {
+        return -1; 
+    }
+    char response[1024];
+    memmove(response, start, end - start);
+    buf->len -= end-start;
+
+    response[end - start] = '\0';
+    LOGE("read_handshake %s", response);
+    return 0;
+}
+
+void
+ws_addheader(buffer_t* buf)
+{
+    buffer_t header;
+    balloc(&header, BUF_SIZE);
+    uint8_t* p = header.data;
+    uint32_t len = 0;
+    p[0] = 0x82;
+    if (buf->len <= 125) {
+        p[1] = buf->len;
+        len = 2;
+    } else if (buf->len <= 65535) {
+        p[1] = 126;
+        p[2] = (buf->len >> 8) & 0xff;
+        p[3] = buf->len & 0xff;
+        len = 4;
+    } else {
+        ERROR("ws_addheader");    
+        return;
+    }
+    header.len = len;
+    bprepend(buf, &header, BUF_SIZE);
+    bfree(&header);
+    LOGE("call ws_addheader");
+}
+
 int
 setnonblocking(int fd)
 {
@@ -323,6 +386,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                     close_and_free_server(EV_A_ server);
                     return;
                 }
+                ws_addheader(remote->buf);
 
                 if (server->abuf) {
                     bprepend(remote->buf, server->abuf, BUF_SIZE);
@@ -775,6 +839,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                     close_and_free_server(EV_A_ server);
                     return;
                 }
+                ws_addheader(abuf);
             }
 
             if (buf->len > 0) {
@@ -869,6 +934,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 
     ev_timer_again(EV_A_ & remote->recv_ctx->watcher);
 
+    LOGE("call remote_recv_cb");
     ssize_t r = recv(remote->fd, server->buf->data, BUF_SIZE, 0);
 
     if (r == 0) {
@@ -890,6 +956,21 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     }
 
     server->buf->len = r;
+
+    // process handshake
+    LOGE("call process handshake");
+    if (remote->handshake == 0) {
+        LOGE("call read_handshake");
+        ssize_t s = read_handshake(server->buf);
+        if(s == 0) {
+            remote->handshake = 1;
+        } else {
+            ERROR("read_handshake");
+            close_and_free_remote(EV_A_ remote);
+            close_and_free_server(EV_A_ server);
+        }
+        return;
+    }
 
     if (!remote->direct) {
 #ifdef __ANDROID__
@@ -947,8 +1028,17 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
     if (!remote_send_ctx->connected) {
         struct sockaddr_storage addr;
         socklen_t len = sizeof addr;
-        int r         = getpeername(remote->fd, (struct sockaddr *)&addr, &len);
+        int r = getpeername(remote->fd, (struct sockaddr *)&addr, &len);
         if (r == 0) {
+            LOGE("call send_handshake");
+            ssize_t s = send_handshake(remote->fd);
+            if (s < 0) {
+                ERROR("send_handshake");
+                close_and_free_remote(EV_A_ remote);
+                close_and_free_server(EV_A_ server);
+                return;
+            }
+
             remote_send_ctx->connected = 1;
             ev_timer_stop(EV_A_ & remote_send_ctx->watcher);
             ev_timer_start(EV_A_ & remote->recv_ctx->watcher);
@@ -967,6 +1057,11 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
             close_and_free_server(EV_A_ server);
             return;
         }
+    }
+
+    // return from callback if handshake not complete
+    if (remote->handshake == 0) {
+        return;
     }
 
     if (remote->buf->len == 0) {
