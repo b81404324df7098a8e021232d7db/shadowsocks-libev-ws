@@ -66,6 +66,7 @@ typedef struct server {
 
     buffer_t *buf;
     buffer_t *abuf;
+    buffer_t *send_buf;
 
     ev_timer delayed_connect_watcher;
 
@@ -88,6 +89,7 @@ typedef struct remote {
 
     // websocket
     int handshake;
+    uint32_t frameleft;
 
     buffer_t *buf;
 

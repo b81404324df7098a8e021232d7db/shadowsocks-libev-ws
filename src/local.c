@@ -148,7 +148,6 @@ send_handshake(int fd)
     strcat(handshake, "Sec-WebSocket-Version: 13\r\n\r\n");
     
     ssize_t r = send(fd, handshake, strlen(handshake), 0);
-    LOGE("handshake\n %s", handshake);
     return r;
 }
 
@@ -165,13 +164,12 @@ read_handshake(buffer_t* buf)
     if (end > start + len) {
         return -1; 
     }
-    char response[1024];
-    memmove(response, start, end - start);
-    buf->len -= end-start;
 
+    char response[1024];
+    memmove(response, start, end - start + 4);
     response[end - start] = '\0';
-    LOGE("read_handshake %s", response);
-    return 0;
+
+    return end - start + 4;
 }
 
 void
@@ -179,7 +177,7 @@ ws_addheader(buffer_t* buf)
 {
     buffer_t header;
     balloc(&header, BUF_SIZE);
-    uint8_t* p = header.data;
+    uint8_t* p = (uint8_t*)header.data;
     uint32_t len = 0;
     p[0] = 0x82;
     if (buf->len <= 125) {
@@ -197,7 +195,6 @@ ws_addheader(buffer_t* buf)
     header.len = len;
     bprepend(buf, &header, BUF_SIZE);
     bfree(&header);
-    LOGE("call ws_addheader");
 }
 
 int
@@ -863,15 +860,15 @@ server_send_cb(EV_P_ ev_io *w, int revents)
     server_ctx_t *server_send_ctx = (server_ctx_t *)w;
     server_t *server              = server_send_ctx->server;
     remote_t *remote              = server->remote;
-    if (server->buf->len == 0) {
+    if (server->send_buf->len == 0) {
         // close and free
         close_and_free_remote(EV_A_ remote);
         close_and_free_server(EV_A_ server);
         return;
     } else {
         // has data to send
-        ssize_t s = send(server->fd, server->buf->data + server->buf->idx,
-                         server->buf->len, 0);
+        ssize_t s = send(server->fd, server->send_buf->data + server->send_buf->idx,
+                         server->send_buf->len, 0);
         if (s == -1) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 ERROR("server_send_cb_send");
@@ -879,15 +876,15 @@ server_send_cb(EV_P_ ev_io *w, int revents)
                 close_and_free_server(EV_A_ server);
             }
             return;
-        } else if (s < (ssize_t)(server->buf->len)) {
+        } else if (s < (ssize_t)(server->send_buf->len)) {
             // partly sent, move memory, wait for the next time to send
-            server->buf->len -= s;
-            server->buf->idx += s;
+            server->send_buf->len -= s;
+            server->send_buf->idx += s;
             return;
         } else {
             // all sent out, wait for reading
-            server->buf->len = 0;
-            server->buf->idx = 0;
+            server->send_buf->len = 0;
+            server->send_buf->idx = 0;
             ev_io_stop(EV_A_ & server_send_ctx->io);
             ev_io_start(EV_A_ & remote->recv_ctx->io);
             return;
@@ -934,8 +931,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 
     ev_timer_again(EV_A_ & remote->recv_ctx->watcher);
 
-    LOGE("call remote_recv_cb");
-    ssize_t r = recv(remote->fd, server->buf->data, BUF_SIZE, 0);
+    ssize_t r = recv(remote->fd, server->buf->data + server->buf->len, BUF_SIZE - server->buf->len, 0);
 
     if (r == 0) {
         // connection closed
@@ -955,15 +951,15 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
         }
     }
 
-    server->buf->len = r;
+    server->buf->len += r;
 
     // process handshake
-    LOGE("call process handshake");
     if (remote->handshake == 0) {
-        LOGE("call read_handshake");
         ssize_t s = read_handshake(server->buf);
-        if(s == 0) {
+        if(s > 0) {
             remote->handshake = 1;
+            memmove(server->buf->data, server->buf->data + s, server->buf->len - s);
+            server->buf->len -= s;
         } else {
             ERROR("read_handshake");
             close_and_free_remote(EV_A_ remote);
@@ -972,12 +968,59 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
         return;
     }
 
+    if (remote->handshake == 1) {
+        while(server->buf->len > 0) {
+            if (remote->frameleft == 0) {
+                // decode frame
+                uint8_t* inp = (uint8_t*)server->buf->data;
+                uint32_t hdrlen;
+
+                if ((inp[0] & 0xf) == 0x08) {
+                    close_and_free_remote(EV_A_ remote);
+                    close_and_free_server(EV_A_ server);
+                    return;
+                }
+
+                if (server->buf->len < 4)
+                    return;
+                if (inp[1] <= 125) {
+                    remote->frameleft = inp[1];
+                    hdrlen = 2;
+                } else if (inp[1] == 126) {
+                    remote->frameleft = (inp[2] << 8) + inp[3]; 
+                    hdrlen = 4;
+                } else {
+                    remote->frameleft = inp[9] +
+                                        (inp[8] << 8) +
+                                        (inp[7] << 16) +
+                                        (inp[6] << 24);
+                    hdrlen = 8;
+                }
+
+                memmove(server->buf->data, server->buf->data + hdrlen, server->buf->len - hdrlen);
+                server->buf->len -= hdrlen;
+            } 
+
+            if (remote->frameleft > 0) {
+                uint32_t buflen = server->buf->len;
+                uint32_t framelen = remote->frameleft < buflen ? remote->frameleft : buflen;
+                remote->frameleft -= framelen;
+
+                memmove(server->send_buf->data + server->send_buf->len, server->buf->data, framelen);
+                server->send_buf->len += framelen;
+
+                memmove(server->buf->data, server->buf->data + framelen, server->buf->len - framelen);
+                server->buf->len -= framelen;
+            }
+        }
+    }
+
     if (!remote->direct) {
 #ifdef __ANDROID__
-        rx += server->buf->len;
+        rx += server->send_buf->len;
         stat_update_cb();
 #endif
-        int err = crypto->decrypt(server->buf, server->d_ctx, BUF_SIZE);
+        int err = crypto->decrypt(server->send_buf, server->d_ctx, BUF_SIZE);
         if (err == CRYPTO_ERROR) {
             LOGE("invalid password or cipher");
             close_and_free_remote(EV_A_ remote);
@@ -988,12 +1031,13 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
         }
     }
 
-    int s = send(server->fd, server->buf->data, server->buf->len, 0);
+    int s = send(server->fd, server->send_buf->data, server->send_buf->len, 0);
 
     if (s == -1) {
+        LOGE("send error");
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // no data, wait for send
-            server->buf->idx = 0;
+            server->send_buf->idx = 0;
             ev_io_stop(EV_A_ & remote_recv_ctx->io);
             ev_io_start(EV_A_ & server->send_ctx->io);
         } else {
@@ -1002,11 +1046,13 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
             close_and_free_server(EV_A_ server);
             return;
         }
-    } else if (s < (int)(server->buf->len)) {
-        server->buf->len -= s;
-        server->buf->idx  = s;
+    } else if (s < (int)(server->send_buf->len)) {
+        server->send_buf->len -= s;
+        server->send_buf->idx  = s;
         ev_io_stop(EV_A_ & remote_recv_ctx->io);
         ev_io_start(EV_A_ & server->send_ctx->io);
+    } else {
+        server->send_buf->len = 0;
     }
 
     // Disable TCP_NODELAY after the first response are sent
@@ -1030,7 +1076,6 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
         socklen_t len = sizeof addr;
         int r = getpeername(remote->fd, (struct sockaddr *)&addr, &len);
         if (r == 0) {
-            LOGE("call send_handshake");
             ssize_t s = send_handshake(remote->fd);
             if (s < 0) {
                 ERROR("send_handshake");
@@ -1165,8 +1210,10 @@ new_server(int fd)
     server->recv_ctx = ss_malloc(sizeof(server_ctx_t));
     server->send_ctx = ss_malloc(sizeof(server_ctx_t));
     server->buf      = ss_malloc(sizeof(buffer_t));
+    server->send_buf = ss_malloc(sizeof(buffer_t));
     server->abuf     = ss_malloc(sizeof(buffer_t));
     balloc(server->buf, BUF_SIZE);
+    balloc(server->send_buf, BUF_SIZE);
     balloc(server->abuf, BUF_SIZE);
     memset(server->recv_ctx, 0, sizeof(server_ctx_t));
     memset(server->send_ctx, 0, sizeof(server_ctx_t));
