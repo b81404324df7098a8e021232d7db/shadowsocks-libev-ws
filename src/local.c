@@ -140,12 +140,16 @@ static struct cork_dllist connections;
 int 
 send_handshake(int fd)
 {
-    char handshake[1024] = "";
+    char handshake[2048] = "";
     strcpy(handshake, "GET / HTTP/1.1\r\n");
     strcat(handshake, "Upgrade: websocket\r\n");
     strcat(handshake, "Connection: Upgrade\r\n");
-    strcat(handshake, "Sec-WebSocket-Key: hi\r\n");
-    strcat(handshake, "Sec-WebSocket-Version: 13\r\n\r\n");
+    strcat(handshake, "Host: wilsonvpn.herokuapp.com\r\n");
+    strcat(handshake, "Sec-WebSocket-Version: 13\r\n");
+    strcat(handshake, "Sec-WebSocket-Key: MTMtMTQ5NTgwOTU2NzQ5Mw==\r\n");
+    strcat(handshake, "Sec-WebSocket-Protocol: binary\r\n");
+    //strcat(handshake, "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n");
+    strcat(handshake, "\r\n");
     
     ssize_t r = send(fd, handshake, strlen(handshake), 0);
     return r;
@@ -155,13 +159,13 @@ int
 read_handshake(buffer_t* buf)
 {
     char *start = buf->data;
-    char len = buf->len;
-    char *end = start - 4;
+    int len = buf->len;
+    char *end = start;
 
     while(memcmp(end, "\r\n\r\n", 4) != 0 && end  - start <= len) {
         end++;
     }
-    if (end > start + len) {
+    if (end - start > len - 4) {
         return -1; 
     }
 
@@ -189,7 +193,7 @@ ws_addheader(buffer_t* buf)
         p[3] = buf->len & 0xff;
         len = 4;
     } else {
-        ERROR("ws_addheader");    
+        ERROR("wtf ws_addheader");    
         return;
     }
     header.len = len;
@@ -975,26 +979,31 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
                 uint8_t* inp = (uint8_t*)server->buf->data;
                 uint32_t hdrlen;
 
-                if ((inp[0] & 0xf) == 0x08) {
+                if ((inp[0] & 0xf) != 0x02) {
+                    LOGE("frame type %d", inp[0] & 0xf);
                     close_and_free_remote(EV_A_ remote);
                     close_and_free_server(EV_A_ server);
                     return;
                 }
 
-                if (server->buf->len < 4)
+                if (server->buf->len < 2)
                     return;
                 if (inp[1] <= 125) {
                     remote->frameleft = inp[1];
                     hdrlen = 2;
                 } else if (inp[1] == 126) {
+                    if (server->buf->len < 4)
+                        return;
                     remote->frameleft = (inp[2] << 8) + inp[3]; 
                     hdrlen = 4;
                 } else {
+                    if (server->buf->len < 10)
+                        return;
                     remote->frameleft = inp[9] +
                                         (inp[8] << 8) +
                                         (inp[7] << 16) +
                                         (inp[6] << 24);
-                    hdrlen = 8;
+                    hdrlen = 10;
                 }
 
                 memmove(server->buf->data, server->buf->data + hdrlen, server->buf->len - hdrlen);
@@ -1002,8 +1011,10 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
             } 
 
             if (remote->frameleft > 0) {
-                uint32_t buflen = server->buf->len;
-                uint32_t framelen = remote->frameleft < buflen ? remote->frameleft : buflen;
+                int buflen = server->buf->len;
+                if (buflen == 0)
+                    return;
+                int framelen = remote->frameleft < buflen ? remote->frameleft : buflen;
                 remote->frameleft -= framelen;
 
                 memmove(server->send_buf->data + server->send_buf->len, server->buf->data, framelen);

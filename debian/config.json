@@ -1,6 +1,6 @@
 {
-    "server":"10.0.0.15",
-    "server_port":8081,
+    "server":"xxx.herokuapp.com",
+    "server_port":80,
     "local_address":"10.0.0.15",
     "local_port":1081,
     "password":"password",

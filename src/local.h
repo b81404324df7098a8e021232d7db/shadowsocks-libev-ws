@@ -89,7 +89,7 @@ typedef struct remote {
 
     // websocket
     int handshake;
-    uint32_t frameleft;
+    int frameleft;
 
     buffer_t *buf;
 
