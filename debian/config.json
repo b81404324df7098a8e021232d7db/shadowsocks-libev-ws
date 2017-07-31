@@ -1,9 +1,9 @@
 {
-    "server":"xxx.herokuapp.com",
+    "server":"*.herokuapp.com",
     "server_port":80,
-    "local_address":"10.0.0.15",
-    "local_port":1081,
-    "password":"password",
+    "local_address":"0.0.0.0",
+    "local_port":1080,
+    "password":"",
     "timeout":60,
-    "method":"rc4-md5"
+    "method":""
 }

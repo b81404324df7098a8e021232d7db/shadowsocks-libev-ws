@@ -148,7 +148,6 @@ send_handshake(int fd)
     strcat(handshake, "Sec-WebSocket-Version: 13\r\n");
     strcat(handshake, "Sec-WebSocket-Key: MTMtMTQ5NTgwOTU2NzQ5Mw==\r\n");
     strcat(handshake, "Sec-WebSocket-Protocol: binary\r\n");
-    //strcat(handshake, "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n");
     strcat(handshake, "\r\n");
     
     ssize_t r = send(fd, handshake, strlen(handshake), 0);
@@ -973,44 +972,43 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     }
 
     if (remote->handshake == 1) {
-        while(server->buf->len > 0) {
-            if (remote->frameleft == 0) {
-                // decode frame
-                uint8_t* inp = (uint8_t*)server->buf->data;
-                uint32_t hdrlen;
+        if (remote->frameleft == 0) {
+            // decode frame
+            uint8_t* inp = (uint8_t*)server->buf->data;
+            uint32_t hdrlen;
 
-                if ((inp[0] & 0xf) != 0x02) {
-                    LOGE("frame type %d", inp[0] & 0xf);
-                    close_and_free_remote(EV_A_ remote);
-                    close_and_free_server(EV_A_ server);
+            if ((inp[0] & 0xf) != 0x02) {
+                LOGE("frame type %d", inp[0] & 0xf);
+                close_and_free_remote(EV_A_ remote);
+                close_and_free_server(EV_A_ server);
+                return;
+            }
+
+            if (server->buf->len < 2)
+                return;
+            if (inp[1] <= 125) {
+                remote->frameleft = inp[1];
+                hdrlen = 2;
+            } else if (inp[1] == 126) {
+                if (server->buf->len < 4)
                     return;
-                }
-
-                if (server->buf->len < 2)
+                remote->frameleft = (inp[2] << 8) + inp[3]; 
+                hdrlen = 4;
+            } else {
+                if (server->buf->len < 10)
                     return;
-                if (inp[1] <= 125) {
-                    remote->frameleft = inp[1];
-                    hdrlen = 2;
-                } else if (inp[1] == 126) {
-                    if (server->buf->len < 4)
-                        return;
-                    remote->frameleft = (inp[2] << 8) + inp[3]; 
-                    hdrlen = 4;
-                } else {
-                    if (server->buf->len < 10)
-                        return;
-                    remote->frameleft = inp[9] +
-                                        (inp[8] << 8) +
-                                        (inp[7] << 16) +
-                                        (inp[6] << 24);
-                    hdrlen = 10;
-                }
+                remote->frameleft = inp[9] +
+                                    (inp[8] << 8) +
+                                    (inp[7] << 16) +
+                                    (inp[6] << 24);
+                hdrlen = 10;
+            }
 
-                memmove(server->buf->data, server->buf->data + hdrlen, server->buf->len - hdrlen);
-                server->buf->len -= hdrlen;
-            } 
+            memmove(server->buf->data, server->buf->data + hdrlen, server->buf->len - hdrlen);
+            server->buf->len -= hdrlen;
+        }
 
-            if (remote->frameleft > 0) {
+        while(server->buf->len > 0 && remote->frameleft > 0) {
                 int buflen = server->buf->len;
                 if (buflen == 0)
                     return;
@@ -1022,7 +1020,6 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 
                 memmove(server->buf->data, server->buf->data + framelen, server->buf->len - framelen);
                 server->buf->len -= framelen;
-            }
         }
     }
 
